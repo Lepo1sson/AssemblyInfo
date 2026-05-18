@@ -1,6 +1,7 @@
 param(
-    [string]$Python = "py",
-    [string]$ExeName = "AssemblyInfo"
+    [string]$Python = "python",
+    [string]$ExeName = "AssemblyInfo",
+    [switch]$OneFile
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,13 +20,24 @@ if (-not (Test-Path $PythonExe)) {
 & $PythonExe -m pip install --upgrade pip
 & $PythonExe -m pip install -r $Requirements
 
-& $PythonExe -m PyInstaller `
-    --noconfirm `
-    --clean `
-    --onefile `
-    --windowed `
-    --name $ExeName `
-    $EntryPoint
+$PyInstallerArgs = @(
+    "--noconfirm",
+    "--clean",
+    "--windowed",
+    "--name", $ExeName
+)
+
+if ($OneFile) {
+    $PyInstallerArgs += "--onefile"
+}
+
+$PyInstallerArgs += $EntryPoint
+& $PythonExe -m PyInstaller @PyInstallerArgs
 
 Write-Host ""
-Write-Host "Build termine: $(Join-Path $ProjectDir "dist\$ExeName.exe")"
+if ($OneFile) {
+    Write-Host "Build termine: $(Join-Path $ProjectDir "dist\$ExeName.exe")"
+} else {
+    Write-Host "Build termine: $(Join-Path $ProjectDir "dist\$ExeName\$ExeName.exe")"
+    Write-Host "Mode onedir utilise pour accelerer le lancement Windows."
+}

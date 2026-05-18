@@ -1,14 +1,39 @@
 #!/usr/bin/env python3
+import json
 import os
+import socket
 import subprocess
 import struct
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import which
 from urllib.parse import unquote
 from zipfile import ZipFile
+
+WINDOWS_RESIDENT_PORT = 48172
+
+
+def maybe_forward_to_windows_resident() -> None:
+    if sys.platform != "win32" or "--text" in sys.argv or "--resident-child" in sys.argv:
+        return
+    args = [arg for arg in sys.argv[1:] if arg != "--text"]
+    if not args:
+        return
+    try:
+        with socket.create_connection(("127.0.0.1", WINDOWS_RESIDENT_PORT), timeout=0.25) as client:
+            payload = json.dumps({"args": args}).encode("utf-8") + b"\n"
+            client.sendall(payload)
+            client.settimeout(0.5)
+            if client.recv(16).strip() == b"ok":
+                raise SystemExit(0)
+    except (OSError, TimeoutError):
+        return
+
+
+maybe_forward_to_windows_resident()
 
 from PySide6.QtCore import QEasingCurve, QObject, QParallelAnimationGroup, QPropertyAnimation, QThread, QTimer, QSize, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QIcon, QKeySequence, QShortcut
@@ -35,6 +60,7 @@ ARCHIVE_EXTENSIONS = (".zip", ".nupkg", ".jar", ".rar")
 ZIP_EXTENSIONS = (".zip", ".nupkg", ".jar")
 EXTERNAL_ARCHIVE_EXTENSIONS = (".rar",)
 MAX_ARCHIVE_ENTRY_BYTES = 300 * 1024 * 1024
+WINDOWS_NO_WINDOW_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 if sys.platform == "win32":
     CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "dll-assembly-info"
 else:
@@ -90,6 +116,60 @@ class PluginTypeWorker(QObject):
         self.finished.emit(detect_plugin_type(self.args))
 
 
+class WindowsResidentBridge(QObject):
+    openRequested = Signal(list)
+
+
+def start_windows_resident_server(bridge: WindowsResidentBridge) -> threading.Thread | None:
+    if sys.platform != "win32":
+        return None
+
+    try:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", WINDOWS_RESIDENT_PORT))
+        server.listen(8)
+    except OSError:
+        return None
+
+    def serve() -> None:
+        with server:
+            while True:
+                try:
+                    connection, _address = server.accept()
+                except OSError:
+                    return
+                threading.Thread(target=handle_windows_resident_connection, args=(connection, bridge), daemon=True).start()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return thread
+
+
+def handle_windows_resident_connection(connection: socket.socket, bridge: WindowsResidentBridge) -> None:
+    with connection:
+        try:
+            connection.settimeout(1.5)
+            data = b""
+            while not data.endswith(b"\n") and len(data) < 1_000_000:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            message = json.loads(data.decode("utf-8"))
+            args = message.get("args", [])
+            if isinstance(args, list) and all(isinstance(arg, str) for arg in args):
+                bridge.openRequested.emit(args)
+                connection.sendall(b"ok\n")
+            else:
+                connection.sendall(b"bad\n")
+        except Exception:
+            try:
+                connection.sendall(b"bad\n")
+            except OSError:
+                pass
+
+
 def main() -> int:
     text_mode = "--text" in sys.argv
     args = [arg for arg in sys.argv[1:] if arg != "--text"]
@@ -103,9 +183,32 @@ def main() -> int:
     app.setDesktopFileName("dll-assembly-info")
     QIcon.setThemeName(QIcon.themeName() or "breeze")
 
-    window = AssemblyInfoWindow(assemblies, args)
-    window.show()
+    windows: list[AssemblyInfoWindow] = []
+
+    def open_window(open_args: list[str], open_assemblies: list[AssemblyDisplay] | None = None) -> None:
+        window_assemblies = open_assemblies if open_assemblies is not None else filter_assemblies(inspect_args(open_args))
+        window = AssemblyInfoWindow(window_assemblies, open_args)
+        windows.append(window)
+        window.destroyed.connect(lambda _object=None, shown_window=window: remove_window_reference(windows, shown_window))
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    if sys.platform == "win32":
+        app.setQuitOnLastWindowClosed(False)
+        resident_bridge = WindowsResidentBridge()
+        resident_bridge.openRequested.connect(lambda open_args: open_window(open_args))
+        start_windows_resident_server(resident_bridge)
+
+    open_window(args, assemblies)
     return app.exec()
+
+
+def remove_window_reference(windows: list["AssemblyInfoWindow"], window: "AssemblyInfoWindow") -> None:
+    try:
+        windows.remove(window)
+    except ValueError:
+        pass
 
 
 class AssemblyInfoWindow(QWidget):
@@ -457,7 +560,7 @@ class AssemblyWidget(QWidget):
                 return f'Due to the plugin\'s incorrect assembly info, version "{version}" is logged, and the file is named "{file_name}".'
             if name_checked:
                 return f'Due to the plugin\'s incorrect assembly info, the file is named "{file_name}".'
-            return f"Due to the incorrect AssemblyInfo of the plugin, version {version} is logged."
+            return f"Due to the incorrect assembly info of the plugin, version {version} is logged."
 
         if name_checked and version_checked:
             return f"Hello, I just wanted to point out that the assembly version of your plugin is: `{version} instead of: and the Assembly name of your plugins is: `{name}"
@@ -659,6 +762,10 @@ def inspect_path(path: Path) -> list[AssemblyDisplay]:
 
 
 def inspect_rar_directory(path: Path, source: str) -> list[AssemblyDisplay]:
+    return inspect_directory_entries(path, source, "Aucun .dll ou .exe trouve dans le dossier .rar.")
+
+
+def inspect_directory_entries(path: Path, source: str, empty_message: str) -> list[AssemblyDisplay]:
     assemblies: list[AssemblyDisplay] = []
     for candidate in path.rglob("*"):
         if candidate.is_file() and candidate.name.lower().endswith((".dll", ".exe")):
@@ -668,7 +775,7 @@ def inspect_rar_directory(path: Path, source: str) -> list[AssemblyDisplay]:
             except Exception as exc:
                 assemblies.append(AssemblyDisplay(source, entry, message=f"Erreur de lecture dossier: {exc}"))
     if not assemblies:
-        assemblies.append(AssemblyDisplay(source, path.name, message="Aucun .dll ou .exe trouve dans le dossier .rar."))
+        assemblies.append(AssemblyDisplay(source, path.name, message=empty_message))
     return assemblies
 
 
@@ -685,8 +792,20 @@ def inspect_zip(path: Path, source: str) -> list[AssemblyDisplay]:
 
 
 def inspect_external_archive(path: Path, source: str) -> list[AssemblyDisplay]:
+    windows_shell_error: Exception | None = None
+    if sys.platform == "win32":
+        try:
+            return inspect_windows_shell_archive(path, source)
+        except Exception as exc:
+            windows_shell_error = exc
+
     assemblies: list[AssemblyDisplay] = []
-    names = list_external_archive_entries(path)
+    try:
+        names = list_external_archive_entries(path)
+    except Exception as exc:
+        if windows_shell_error is not None:
+            raise ValueError(f"Impossible de lire l'archive avec l'Explorateur Windows: {windows_shell_error}") from exc
+        raise
     for name in names:
         lower = name.lower()
         if lower.endswith((".dll", ".exe")) and not name.endswith("/"):
@@ -697,6 +816,99 @@ def inspect_external_archive(path: Path, source: str) -> list[AssemblyDisplay]:
     if not assemblies:
         assemblies.append(AssemblyDisplay(source, path.name, message="Aucun .dll ou .exe trouve dans l'archive."))
     return assemblies
+
+
+def inspect_windows_shell_archive(path: Path, source: str) -> list[AssemblyDisplay]:
+    with tempfile.TemporaryDirectory(prefix="dll-assembly-info-rar-") as temp_dir:
+        extract_windows_shell_archive(path, Path(temp_dir))
+        return inspect_directory_entries(Path(temp_dir), source, "Aucun .dll ou .exe trouve dans l'archive.")
+
+
+def extract_windows_shell_archive(path: Path, destination: Path) -> None:
+    powershell = which("powershell.exe") or which("powershell") or which("pwsh.exe") or which("pwsh")
+    if powershell is None:
+        raise ValueError("PowerShell introuvable")
+
+    script = r"""
+param($ArchivePath, $DestPath)
+
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+
+try {
+    $ErrorActionPreference = 'Stop'
+    if ([string]::IsNullOrWhiteSpace($ArchivePath) -or [string]::IsNullOrWhiteSpace($DestPath)) {
+        throw "Chemin d'archive ou destination manquant."
+    }
+    $archiveItem = Get-Item -LiteralPath $ArchivePath
+    $destItem = New-Item -ItemType Directory -Force -Path $DestPath
+    $shell = New-Object -ComObject Shell.Application
+    $archive = $shell.Namespace($archiveItem.FullName)
+    $destination = $shell.Namespace($destItem.FullName)
+    if ($null -eq $archive -or $null -eq $destination) {
+        throw "L'Explorateur Windows ne peut pas ouvrir cette archive."
+    }
+
+    function Collect-Assemblies($folder) {
+        $foundItems = @()
+        foreach ($item in @($folder.Items())) {
+            if ($item.IsFolder) {
+                $child = $item.GetFolder()
+                if ($null -ne $child) {
+                    $foundItems += Collect-Assemblies $child
+                }
+            } elseif ($item.Name -match '\.(dll|exe)$') {
+                $foundItems += $item
+            }
+        }
+        return $foundItems
+    }
+
+    $items = @(Collect-Assemblies $archive)
+    $expected = $items.Count
+    foreach ($item in $items) {
+        $destination.CopyHere($item, 1044)
+    }
+    $deadline = (Get-Date).AddSeconds(90)
+    do {
+        Start-Sleep -Milliseconds 250
+        $copied = @(Get-ChildItem -LiteralPath $destItem.FullName -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '\.(dll|exe)$' }).Count
+    } while ($copied -lt $expected -and (Get-Date) -lt $deadline)
+
+    if ($expected -gt 0 -and $copied -lt 1) {
+        throw "L'Explorateur Windows n'a pas extrait les DLL/EXE de l'archive."
+    }
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+"""
+    script_path: Path | None = None
+    try:
+        fd, script_name = tempfile.mkstemp(prefix="dll-assembly-info-rar-", suffix=".ps1", text=True)
+        script_path = Path(script_name)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\r\n") as file:
+            file.write(script)
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script_path), str(path), str(destination)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            creationflags=WINDOWS_NO_WINDOW_CREATIONFLAGS,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            raise ValueError((result.stderr or result.stdout or "PowerShell n'a pas pu extraire l'archive").strip())
+    finally:
+        if script_path is not None:
+            try:
+                script_path.unlink()
+            except OSError:
+                pass
 
 
 def list_external_archive_entries(path: Path) -> list[str]:
@@ -902,10 +1114,14 @@ def detect_plugin_type(args: list[str]) -> str:
         try:
             if arg.startswith(("zip:/", "tar:/", "rar:/", "krarc:/")):
                 archive_path, _entry_name = parse_archive_url(arg)
+                if sys.platform == "win32" and archive_path.name.lower().endswith(EXTERNAL_ARCHIVE_EXTENSIONS):
+                    continue
                 structure, readme = detect_archive_type(archive_path)
             else:
                 path = Path(unquote(arg.removeprefix("file://"))) if arg.startswith("file://") else Path(arg)
                 if path.is_file() and path.name.lower().endswith(ARCHIVE_EXTENSIONS):
+                    if sys.platform == "win32" and path.name.lower().endswith(EXTERNAL_ARCHIVE_EXTENSIONS):
+                        continue
                     structure, readme = detect_archive_type(path)
                 else:
                     structure = classify_path(str(path))

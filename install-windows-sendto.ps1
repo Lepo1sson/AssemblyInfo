@@ -6,7 +6,13 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 if ([string]::IsNullOrWhiteSpace($ExePath)) {
-    $ExePath = Join-Path $ProjectDir "dist\AssemblyInfo.exe"
+    $OneDirExe = Join-Path $ProjectDir "dist\AssemblyInfo\AssemblyInfo.exe"
+    $OneFileExe = Join-Path $ProjectDir "dist\AssemblyInfo.exe"
+    if (Test-Path $OneDirExe) {
+        $ExePath = $OneDirExe
+    } else {
+        $ExePath = $OneFileExe
+    }
 }
 
 $ResolvedExe = Resolve-Path $ExePath
