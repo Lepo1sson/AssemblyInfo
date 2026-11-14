@@ -557,15 +557,15 @@ class AssemblyWidget(QWidget):
         version = self.assembly_version or ""
         if mode == "desc":
             if name_checked and version_checked:
-                return f'Due to the plugin\'s incorrect assembly info, version "`{version}`" is logged, and the file is named "`{file_name}`".'
+                return f'Due to the plugin\'s incorrect assembly info, version "{version}" is logged, and the file is named "{file_name}".'
             if name_checked:
-                return f'Due to the plugin\'s incorrect assembly info, the file is named "`{file_name}`".'
-            return f"Due to the incorrect assembly info of the plugin, version `{version}` is logged."
+                return f'Due to the plugin\'s incorrect assembly info, the file is named "{file_name}".'
+            return f"Due to the incorrect assembly info of the plugin, version {version} is logged."
 
         if name_checked and version_checked:
-            return f"Hello, I just wanted to point out that the assembly version of your plugin is: `{version}` instead of: ` . And the Assembly name of your plugins is: `{name}`, but the file name is: "
+            return f"Hello, I just wanted to point out that the assembly version of your plugin is: `{version}` instead of: ` ` . And the Assembly name of your plugins is: `{name}`, but the file name is: `{file_name}`"
         if name_checked:
-            return f"Hello, I just wanted to point out that the assembly name of your plugins is: `{name}`, but the file name is: `"
+            return f"Hello, I just wanted to point out that the assembly name of your plugins is: `{name}`, but the file name is: `{file_name}`"
         return f"Hello, I just wanted to point out that the assembly version of your plugin is: `{version}` instead of: `"
 
     def show_copied_then_change(self, text: str, tooltip: str) -> None:
